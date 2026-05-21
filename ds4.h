@@ -61,6 +61,7 @@ typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current
 
 typedef struct {
     const char *model_path;
+    const char *bitlift_sidecar_path;
     const char *mtp_path;
     ds4_backend backend;
     int n_threads;
@@ -114,9 +115,11 @@ int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,
+                               const char *expert_usage_path,
                                int ctx_size,
                                int max_prompts,
-                               int max_tokens);
+                               int max_tokens,
+                               int decode_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);

@@ -2089,6 +2089,13 @@ typedef struct {
     ds4_tensor *ffn_gate_exps;
     ds4_tensor *ffn_up_exps;
     ds4_tensor *ffn_down_exps;
+    ds4_tensor *ffn_gate_exps_bitlift_q4;
+    ds4_tensor *ffn_up_exps_bitlift_q4;
+    ds4_tensor *ffn_down_exps_bitlift_q4;
+    ds4_tensor *ffn_exps_bitlift_q4_ids;
+    const ds4_model *ffn_bitlift_model;
+    int16_t ffn_bitlift_slot[DS4_N_EXPERT];
+    uint32_t ffn_bitlift_count;
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
@@ -2350,6 +2357,130 @@ static void tensor_expect_routed_expert(
                 want[i]);
         exit(1);
     }
+}
+
+static void bitlift_sidecar_reset_layer(ds4_layer_weights *l) {
+    l->ffn_gate_exps_bitlift_q4 = NULL;
+    l->ffn_up_exps_bitlift_q4 = NULL;
+    l->ffn_down_exps_bitlift_q4 = NULL;
+    l->ffn_exps_bitlift_q4_ids = NULL;
+    l->ffn_bitlift_model = NULL;
+    l->ffn_bitlift_count = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        l->ffn_bitlift_slot[e] = -1;
+    }
+}
+
+static int32_t tensor_read_i32_value(const ds4_model *m, const ds4_tensor *t, uint64_t idx) {
+    if (idx >= t->elements) ds4_die("bitlift sidecar id index is outside tensor");
+    int32_t v = 0;
+    memcpy(&v, m->map + t->abs_offset + idx * sizeof(v), sizeof(v));
+    return v;
+}
+
+static void tensor_expect_bitlift_ids(const ds4_tensor *t, uint32_t layer) {
+    if (!t) ds4_die("internal error: missing bitlift id tensor");
+    if (t->type != DS4_TENSOR_I32 || t->ndim != 1) {
+        fprintf(stderr,
+                "ds4: bitlift sidecar ids in layer %u must be a 1D i32 tensor, got type=%s ndim=%u\n",
+                layer,
+                tensor_type_name(t->type),
+                t->ndim);
+        exit(1);
+    }
+    if (t->dim[0] == 0 || t->dim[0] > DS4_N_EXPERT) {
+        fprintf(stderr,
+                "ds4: bitlift sidecar ids in layer %u has invalid length %" PRIu64 "\n",
+                layer,
+                t->dim[0]);
+        exit(1);
+    }
+    if (t->elements != t->dim[0] || t->bytes < t->dim[0] * sizeof(int32_t)) {
+        fprintf(stderr, "ds4: bitlift sidecar ids in layer %u has inconsistent tensor metadata\n", layer);
+        exit(1);
+    }
+}
+
+static bool bitlift_sidecar_try_bind_layer(
+        ds4_layer_weights *l,
+        const ds4_model   *m,
+        uint32_t           layer,
+        bool               reset_if_absent) {
+    if (reset_if_absent) bitlift_sidecar_reset_layer(l);
+
+    ds4_tensor *gate = tensor_by_namef(m, "blk.%u.ffn_gate_exps.bitlift_q4.weight", layer);
+    ds4_tensor *up = tensor_by_namef(m, "blk.%u.ffn_up_exps.bitlift_q4.weight", layer);
+    ds4_tensor *down = tensor_by_namef(m, "blk.%u.ffn_down_exps.bitlift_q4.weight", layer);
+    ds4_tensor *ids = tensor_by_namef(m, "blk.%u.ffn_exps.bitlift_q4.ids", layer);
+
+    const bool has_gate = gate != NULL;
+    const bool has_up = up != NULL;
+    const bool has_down = down != NULL;
+    const bool has_ids = ids != NULL;
+    const uint32_t present = (uint32_t)has_gate + (uint32_t)has_up + (uint32_t)has_down + (uint32_t)has_ids;
+    if (present == 0) return false;
+    if (present != 4) {
+        fprintf(stderr,
+                "ds4: incomplete bitlift Q4 sidecar tensor set in layer %u "
+                "(gate=%u up=%u down=%u ids=%u)\n",
+                layer,
+                has_gate,
+                has_up,
+                has_down,
+                has_ids);
+        exit(1);
+    }
+
+    tensor_expect_bitlift_ids(ids, layer);
+    const uint32_t n_sidecar = (uint32_t)ids->dim[0];
+    tensor_expect_layout(gate, DS4_TENSOR_Q4_K, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_sidecar);
+    tensor_expect_layout(up,   DS4_TENSOR_Q4_K, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_sidecar);
+    tensor_expect_layout(down, DS4_TENSOR_Q4_K, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_sidecar);
+
+    bitlift_sidecar_reset_layer(l);
+    l->ffn_gate_exps_bitlift_q4 = gate;
+    l->ffn_up_exps_bitlift_q4 = up;
+    l->ffn_down_exps_bitlift_q4 = down;
+    l->ffn_exps_bitlift_q4_ids = ids;
+    l->ffn_bitlift_model = m;
+    for (uint32_t slot = 0; slot < n_sidecar; slot++) {
+        const int32_t expert = tensor_read_i32_value(m, ids, slot);
+        if (expert < 0 || expert >= (int32_t)DS4_N_EXPERT) {
+            fprintf(stderr,
+                    "ds4: bitlift sidecar layer %u has invalid expert id %d at slot %u\n",
+                    layer,
+                    expert,
+                    slot);
+            exit(1);
+        }
+        if (l->ffn_bitlift_slot[expert] >= 0) {
+            fprintf(stderr,
+                    "ds4: bitlift sidecar layer %u repeats expert id %d\n",
+                    layer,
+                    expert);
+            exit(1);
+        }
+        l->ffn_bitlift_slot[expert] = (int16_t)slot;
+    }
+    l->ffn_bitlift_count = n_sidecar;
+    return true;
+}
+
+static void bitlift_sidecar_bind_layer(
+        ds4_layer_weights *l,
+        const ds4_model   *m,
+        uint32_t           layer) {
+    (void)bitlift_sidecar_try_bind_layer(l, m, layer, true);
+}
+
+static uint32_t weights_bind_bitlift_sidecar(ds4_weights *w, const ds4_model *m) {
+    uint32_t layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (bitlift_sidecar_try_bind_layer(&w->layer[il], m, il, false)) {
+            layers++;
+        }
+    }
+    return layers;
 }
 
 /* Verify every tensor type and dimension used by the specialized pipeline.
@@ -2695,6 +2826,7 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
         l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
         l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        bitlift_sidecar_bind_layer(l, m, il);
         l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
         l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
         l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -2720,6 +2852,7 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     w->norm          = required_tensor(m, "mtp.0.norm.weight");
 
     ds4_layer_weights *l = &w->block;
+    bitlift_sidecar_reset_layer(l);
     l->hc_attn_fn      = required_tensor(m, "mtp.0.hc_attn_fn.weight");
     l->hc_attn_scale   = required_tensor(m, "mtp.0.hc_attn_scale.weight");
     l->hc_attn_base    = required_tensor(m, "mtp.0.hc_attn_base.weight");
@@ -8224,11 +8357,19 @@ typedef struct {
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *trace_router_selected;
+    ds4_gpu_tensor *trace_router_weights;
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
     ds4_gpu_tensor *routed_down;
     ds4_gpu_tensor *routed_out;
+    ds4_gpu_tensor *bitlift_slot_maps;
+    ds4_gpu_tensor *bitlift_base_selected;
+    ds4_gpu_tensor *bitlift_base_weights;
+    ds4_gpu_tensor *bitlift_side_selected;
+    ds4_gpu_tensor *bitlift_side_weights;
+    ds4_gpu_tensor *bitlift_tmp_out;
     ds4_gpu_tensor *ffn_out;
     ds4_gpu_tensor *after_ffn_hc;
     ds4_gpu_tensor *output_pre;
@@ -8291,6 +8432,11 @@ typedef struct {
     ds4_gpu_tensor *batch_router_probs;
     ds4_gpu_tensor *batch_router_selected;
     ds4_gpu_tensor *batch_router_weights;
+    ds4_gpu_tensor *bitlift_batch_base_selected;
+    ds4_gpu_tensor *bitlift_batch_base_weights;
+    ds4_gpu_tensor *bitlift_batch_side_selected;
+    ds4_gpu_tensor *bitlift_batch_side_weights;
+    ds4_gpu_tensor *bitlift_batch_tmp_out;
     ds4_gpu_tensor *batch_routed_gate;
     ds4_gpu_tensor *batch_routed_up;
     ds4_gpu_tensor *batch_routed_mid;
@@ -8299,6 +8445,7 @@ typedef struct {
     bool batch_routed_mid_is_f16;
     ds4_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
+    bool trace_decode_routes;
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
@@ -8315,6 +8462,11 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_routed_mid);
     ds4_gpu_tensor_free(g->batch_routed_up);
     ds4_gpu_tensor_free(g->batch_routed_gate);
+    ds4_gpu_tensor_free(g->bitlift_batch_tmp_out);
+    ds4_gpu_tensor_free(g->bitlift_batch_side_weights);
+    ds4_gpu_tensor_free(g->bitlift_batch_side_selected);
+    ds4_gpu_tensor_free(g->bitlift_batch_base_weights);
+    ds4_gpu_tensor_free(g->bitlift_batch_base_selected);
     ds4_gpu_tensor_free(g->batch_router_weights);
     ds4_gpu_tensor_free(g->batch_router_selected);
     ds4_gpu_tensor_free(g->batch_router_probs);
@@ -8367,12 +8519,20 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->after_ffn_hc);
     ds4_gpu_tensor_free(g->ffn_out);
     ds4_gpu_tensor_free(g->routed_out);
+    ds4_gpu_tensor_free(g->bitlift_tmp_out);
+    ds4_gpu_tensor_free(g->bitlift_side_weights);
+    ds4_gpu_tensor_free(g->bitlift_side_selected);
+    ds4_gpu_tensor_free(g->bitlift_base_weights);
+    ds4_gpu_tensor_free(g->bitlift_base_selected);
+    ds4_gpu_tensor_free(g->bitlift_slot_maps);
     ds4_gpu_tensor_free(g->routed_down);
     ds4_gpu_tensor_free(g->routed_mid);
     ds4_gpu_tensor_free(g->routed_up);
     ds4_gpu_tensor_free(g->routed_gate);
     ds4_gpu_tensor_free(g->router_weights);
     ds4_gpu_tensor_free(g->router_selected);
+    ds4_gpu_tensor_free(g->trace_router_weights);
+    ds4_gpu_tensor_free(g->trace_router_selected);
     ds4_gpu_tensor_free(g->router_probs);
     ds4_gpu_tensor_free(g->router_logits);
     ds4_gpu_tensor_free(g->shared_out);
@@ -8858,11 +9018,23 @@ static bool metal_graph_alloc_raw_cap(
     g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->trace_router_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
+                                                    DS4_N_EXPERT_USED *
+                                                    sizeof(int));
+    g->trace_router_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
+                                                   DS4_N_EXPERT_USED *
+                                                   sizeof(float));
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->routed_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g->bitlift_slot_maps = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(int32_t));
+    g->bitlift_base_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
+    g->bitlift_base_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->bitlift_side_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
+    g->bitlift_side_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->bitlift_tmp_out = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->after_ffn_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->output_pre = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
     g->output_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HC * sizeof(float));
@@ -8925,6 +9097,11 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_router_probs = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT * sizeof(float));
     g->batch_router_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
     g->batch_router_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
+    g->bitlift_batch_base_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
+    g->bitlift_batch_base_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
+    g->bitlift_batch_side_selected = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(int));
+    g->bitlift_batch_side_weights = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * sizeof(float));
+    g->bitlift_batch_tmp_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_routed_gate = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
@@ -8957,7 +9134,24 @@ static bool metal_graph_alloc_raw_cap(
         }
     }
 
-    const bool ok = state_init_ok && layer_cache_ok &&
+    bool bitlift_slot_maps_ok = g->bitlift_slot_maps != NULL;
+    if (bitlift_slot_maps_ok) {
+        const uint64_t n_slots = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+        int32_t *slot_maps = xmalloc((size_t)n_slots * sizeof(slot_maps[0]));
+        for (uint64_t i = 0; i < n_slots; i++) slot_maps[i] = -1;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+                slot_maps[(uint64_t)il * DS4_N_EXPERT + e] = weights->layer[il].ffn_bitlift_slot[e];
+            }
+        }
+        bitlift_slot_maps_ok =
+            ds4_gpu_tensor_write(g->bitlift_slot_maps, 0,
+                                 slot_maps,
+                                 n_slots * sizeof(slot_maps[0])) != 0;
+        free(slot_maps);
+    }
+
+    const bool ok = state_init_ok && layer_cache_ok && bitlift_slot_maps_ok &&
                     g->cur_hc && g->flat_hc && g->hc_mix && g->hc_split &&
                     g->hc_pre && g->hc_post && g->hc_comb &&
                     g->attn_cur && g->attn_norm && g->qr && g->qr_norm &&
@@ -8970,8 +9164,13 @@ static bool metal_graph_alloc_raw_cap(
                     g->shared_gate && g->shared_up && g->shared_mid &&
                     g->shared_out &&
                     g->router_logits && g->router_probs && g->router_selected && g->router_weights &&
+                    g->trace_router_selected && g->trace_router_weights &&
                     g->routed_gate && g->routed_up && g->routed_mid &&
                     g->routed_down && g->routed_out &&
+                    g->bitlift_slot_maps &&
+                    g->bitlift_base_selected && g->bitlift_base_weights &&
+                    g->bitlift_side_selected && g->bitlift_side_weights &&
+                    g->bitlift_tmp_out &&
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
                     g->output_norm && g->logits &&
@@ -8995,6 +9194,9 @@ static bool metal_graph_alloc_raw_cap(
                     g->batch_shared_mid && g->batch_shared_out &&
                     g->batch_router_logits && g->batch_router_probs &&
                     g->batch_router_selected && g->batch_router_weights &&
+                    g->bitlift_batch_base_selected && g->bitlift_batch_base_weights &&
+                    g->bitlift_batch_side_selected && g->bitlift_batch_side_weights &&
+                    g->bitlift_batch_tmp_out &&
                     g->batch_routed_gate && g->batch_routed_up &&
                     g->batch_routed_mid && g->batch_routed_down &&
                     g->batch_routed_out;
@@ -9210,6 +9412,538 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+static bool metal_graph_trace_router_decode_layer(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || !g->trace_decode_routes) return true;
+    if (!g->trace_router_selected || !g->trace_router_weights ||
+        !g->router_selected || !g->router_weights) {
+        return false;
+    }
+    const uint64_t sel_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(int);
+    const uint64_t weight_bytes = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t sel_off = (uint64_t)il * sel_bytes;
+    const uint64_t weight_off = (uint64_t)il * weight_bytes;
+    return ds4_gpu_tensor_copy(g->trace_router_selected, sel_off,
+                               g->router_selected, 0, sel_bytes) != 0 &&
+           ds4_gpu_tensor_copy(g->trace_router_weights, weight_off,
+                               g->router_weights, 0, weight_bytes) != 0;
+}
+
+static bool bitlift_sidecar_enabled(const ds4_layer_weights *layer) {
+    return layer &&
+           layer->ffn_bitlift_count != 0 &&
+           layer->ffn_bitlift_model != NULL &&
+           layer->ffn_gate_exps_bitlift_q4 != NULL &&
+           layer->ffn_up_exps_bitlift_q4 != NULL &&
+           layer->ffn_down_exps_bitlift_q4 != NULL &&
+           getenv("DS4_BITLIFT_DISABLE") == NULL;
+}
+
+static bool bitlift_sidecar_trace_hits(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_BITLIFT_TRACE_HITS", &cache);
+}
+
+static bool bitlift_sidecar_cpu_partition(void) {
+    static int cache = -1;
+    return metal_graph_env_flag("DS4_BITLIFT_CPU_PARTITION", &cache) ||
+           bitlift_sidecar_trace_hits();
+}
+
+static bool metal_graph_routed_moe_one_plain(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor      *out,
+        ds4_gpu_tensor      *x,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights) {
+    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+
+    return ds4_gpu_routed_moe_one_tensor(out,
+                                          g->routed_gate,
+                                          g->routed_up,
+                                          g->routed_mid,
+                                          g->routed_down,
+                                          model->map,
+                                          model->size,
+                                          layer->ffn_gate_exps->abs_offset,
+                                          layer->ffn_up_exps->abs_offset,
+                                          layer->ffn_down_exps->abs_offset,
+                                          layer->ffn_gate_exps->type,
+                                          layer->ffn_down_exps->type,
+                                          gate_expert_bytes,
+                                          gate_row_bytes,
+                                          down_expert_bytes,
+                                          down_row_bytes,
+                                          DS4_N_EXPERT,
+                                          (uint32_t)expert_in_dim,
+                                          (uint32_t)down_in_dim,
+                                          (uint32_t)routed_out_dim,
+                                          selected,
+                                          weights,
+                                          DS4_N_EXPERT_USED,
+                                          DS4_SWIGLU_CLAMP_EXP,
+                                          x) != 0;
+}
+
+static bool metal_graph_routed_moe_one_from_routes(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_layer_weights *layer,
+        uint32_t             il,
+        ds4_gpu_tensor      *out,
+        ds4_gpu_tensor      *x,
+        const int32_t       *selected_cpu,
+        const float         *weights_cpu) {
+    int base_selected[DS4_N_EXPERT_USED];
+    int side_selected[DS4_N_EXPERT_USED];
+    float base_weights[DS4_N_EXPERT_USED];
+    float side_weights[DS4_N_EXPERT_USED];
+    uint32_t base_count = 0;
+    uint32_t side_count = 0;
+
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        const int32_t expert = selected_cpu[i];
+        int16_t slot = -1;
+        if (expert >= 0 && expert < (int32_t)DS4_N_EXPERT) {
+            slot = layer->ffn_bitlift_slot[expert];
+        }
+        if (slot >= 0) {
+            side_selected[side_count] = slot;
+            side_weights[side_count] = weights_cpu[i];
+            side_count++;
+        } else {
+            base_selected[base_count] = expert;
+            base_weights[base_count] = weights_cpu[i];
+            base_count++;
+        }
+    }
+
+    if (bitlift_sidecar_trace_hits()) {
+        fprintf(stderr, "ds4: bitlift route hit layer=%u base=%u sidecar=%u", il, base_count, side_count);
+        if (side_count != 0) {
+            fprintf(stderr, " side_slots=");
+            for (uint32_t i = 0; i < side_count; i++) {
+                fprintf(stderr, "%s%d", i ? "," : "", side_selected[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (side_count == 0) {
+        if (ds4_gpu_tensor_write(g->bitlift_base_selected, 0,
+                                 base_selected, base_count * sizeof(base_selected[0])) == 0 ||
+            ds4_gpu_tensor_write(g->bitlift_base_weights, 0,
+                                 base_weights, base_count * sizeof(base_weights[0])) == 0) {
+            return false;
+        }
+        return ds4_gpu_routed_moe_one_tensor(out,
+                                              g->routed_gate,
+                                              g->routed_up,
+                                              g->routed_mid,
+                                              g->routed_down,
+                                              model->map,
+                                              model->size,
+                                              layer->ffn_gate_exps->abs_offset,
+                                              layer->ffn_up_exps->abs_offset,
+                                              layer->ffn_down_exps->abs_offset,
+                                              layer->ffn_gate_exps->type,
+                                              layer->ffn_down_exps->type,
+                                              layer->ffn_gate_exps->dim[1] * routed_expert_row_bytes(layer->ffn_gate_exps),
+                                              routed_expert_row_bytes(layer->ffn_gate_exps),
+                                              layer->ffn_down_exps->dim[1] * routed_expert_row_bytes(layer->ffn_down_exps),
+                                              routed_expert_row_bytes(layer->ffn_down_exps),
+                                              DS4_N_EXPERT,
+                                              (uint32_t)layer->ffn_gate_exps->dim[0],
+                                              (uint32_t)layer->ffn_down_exps->dim[0],
+                                              (uint32_t)layer->ffn_down_exps->dim[1],
+                                              g->bitlift_base_selected,
+                                              g->bitlift_base_weights,
+                                              base_count,
+                                              DS4_SWIGLU_CLAMP_EXP,
+                                              x) != 0;
+    }
+
+    bool have_out = false;
+    if (base_count != 0) {
+        if (ds4_gpu_tensor_write(g->bitlift_base_selected, 0,
+                                 base_selected, base_count * sizeof(base_selected[0])) == 0 ||
+            ds4_gpu_tensor_write(g->bitlift_base_weights, 0,
+                                 base_weights, base_count * sizeof(base_weights[0])) == 0) {
+            return false;
+        }
+        if (ds4_gpu_routed_moe_one_tensor(out,
+                                           g->routed_gate,
+                                           g->routed_up,
+                                           g->routed_mid,
+                                           g->routed_down,
+                                           model->map,
+                                           model->size,
+                                           layer->ffn_gate_exps->abs_offset,
+                                           layer->ffn_up_exps->abs_offset,
+                                           layer->ffn_down_exps->abs_offset,
+                                           layer->ffn_gate_exps->type,
+                                           layer->ffn_down_exps->type,
+                                           layer->ffn_gate_exps->dim[1] * routed_expert_row_bytes(layer->ffn_gate_exps),
+                                           routed_expert_row_bytes(layer->ffn_gate_exps),
+                                           layer->ffn_down_exps->dim[1] * routed_expert_row_bytes(layer->ffn_down_exps),
+                                           routed_expert_row_bytes(layer->ffn_down_exps),
+                                           DS4_N_EXPERT,
+                                           (uint32_t)layer->ffn_gate_exps->dim[0],
+                                           (uint32_t)layer->ffn_down_exps->dim[0],
+                                           (uint32_t)layer->ffn_down_exps->dim[1],
+                                           g->bitlift_base_selected,
+                                           g->bitlift_base_weights,
+                                           base_count,
+                                           DS4_SWIGLU_CLAMP_EXP,
+                                           x) == 0) {
+            return false;
+        }
+        have_out = true;
+    }
+
+    if (ds4_gpu_tensor_write(g->bitlift_side_selected, 0,
+                             side_selected, side_count * sizeof(side_selected[0])) == 0 ||
+        ds4_gpu_tensor_write(g->bitlift_side_weights, 0,
+                             side_weights, side_count * sizeof(side_weights[0])) == 0) {
+        return false;
+    }
+
+    const ds4_model *side_model = layer->ffn_bitlift_model;
+    const ds4_tensor *gate = layer->ffn_gate_exps_bitlift_q4;
+    const ds4_tensor *up = layer->ffn_up_exps_bitlift_q4;
+    const ds4_tensor *down = layer->ffn_down_exps_bitlift_q4;
+    ds4_gpu_tensor *side_out = have_out ? g->bitlift_tmp_out : out;
+    if (ds4_gpu_routed_moe_one_tensor(side_out,
+                                       g->routed_gate,
+                                       g->routed_up,
+                                       g->routed_mid,
+                                       g->routed_down,
+                                       side_model->map,
+                                       side_model->size,
+                                       gate->abs_offset,
+                                       up->abs_offset,
+                                       down->abs_offset,
+                                       gate->type,
+                                       down->type,
+                                       gate->dim[1] * routed_expert_row_bytes(gate),
+                                       routed_expert_row_bytes(gate),
+                                       down->dim[1] * routed_expert_row_bytes(down),
+                                       routed_expert_row_bytes(down),
+                                       layer->ffn_bitlift_count,
+                                       (uint32_t)gate->dim[0],
+                                       (uint32_t)down->dim[0],
+                                       (uint32_t)down->dim[1],
+                                       g->bitlift_side_selected,
+                                       g->bitlift_side_weights,
+                                       side_count,
+                                       DS4_SWIGLU_CLAMP_EXP,
+                                       x) == 0) {
+        return false;
+    }
+    if (have_out) {
+        return ds4_gpu_add_tensor(out, out, g->bitlift_tmp_out, DS4_N_EMBD) != 0;
+    }
+    return true;
+}
+
+static bool metal_graph_routed_moe_one_gpu_partition(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_layer_weights *layer,
+        uint32_t             il,
+        ds4_gpu_tensor      *out,
+        ds4_gpu_tensor      *x,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights) {
+    const uint64_t slot_off = (uint64_t)il * DS4_N_EXPERT * sizeof(int32_t);
+    if (ds4_gpu_bitlift_partition_routes_tensor(g->bitlift_base_selected,
+                                                g->bitlift_base_weights,
+                                                g->bitlift_side_selected,
+                                                g->bitlift_side_weights,
+                                                selected,
+                                                weights,
+                                                g->bitlift_slot_maps,
+                                                slot_off,
+                                                1,
+                                                DS4_N_EXPERT_USED) == 0) {
+        return false;
+    }
+
+    if (!metal_graph_routed_moe_one_plain(g,
+                                          model,
+                                          layer,
+                                          out,
+                                          x,
+                                          g->bitlift_base_selected,
+                                          g->bitlift_base_weights)) {
+        return false;
+    }
+
+    const ds4_model *side_model = layer->ffn_bitlift_model;
+    const ds4_tensor *gate = layer->ffn_gate_exps_bitlift_q4;
+    const ds4_tensor *up = layer->ffn_up_exps_bitlift_q4;
+    const ds4_tensor *down = layer->ffn_down_exps_bitlift_q4;
+    if (ds4_gpu_routed_moe_one_tensor(g->bitlift_tmp_out,
+                                      g->routed_gate,
+                                      g->routed_up,
+                                      g->routed_mid,
+                                      g->routed_down,
+                                      side_model->map,
+                                      side_model->size,
+                                      gate->abs_offset,
+                                      up->abs_offset,
+                                      down->abs_offset,
+                                      gate->type,
+                                      down->type,
+                                      gate->dim[1] * routed_expert_row_bytes(gate),
+                                      routed_expert_row_bytes(gate),
+                                      down->dim[1] * routed_expert_row_bytes(down),
+                                      routed_expert_row_bytes(down),
+                                      layer->ffn_bitlift_count,
+                                      (uint32_t)gate->dim[0],
+                                      (uint32_t)down->dim[0],
+                                      (uint32_t)down->dim[1],
+                                      g->bitlift_side_selected,
+                                      g->bitlift_side_weights,
+                                      DS4_N_EXPERT_USED,
+                                      DS4_SWIGLU_CLAMP_EXP,
+                                      x) == 0) {
+        return false;
+    }
+
+    return ds4_gpu_add_tensor(out, out, g->bitlift_tmp_out, DS4_N_EMBD) != 0;
+}
+
+static bool metal_graph_routed_moe_one_maybe_bitlift(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_layer_weights *layer,
+        uint32_t             il,
+        ds4_gpu_tensor      *out,
+        ds4_gpu_tensor      *x,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights) {
+    if (!bitlift_sidecar_enabled(layer)) {
+        return metal_graph_routed_moe_one_plain(g, model, layer, out, x, selected, weights);
+    }
+
+    if (!bitlift_sidecar_cpu_partition()) {
+        return metal_graph_routed_moe_one_gpu_partition(g, model, layer, il, out, x, selected, weights);
+    }
+
+    int32_t selected_cpu[DS4_N_EXPERT_USED];
+    float weights_cpu[DS4_N_EXPERT_USED];
+    if (ds4_gpu_synchronize() == 0 ||
+        ds4_gpu_tensor_read(selected, 0, selected_cpu, sizeof(selected_cpu)) == 0 ||
+        ds4_gpu_tensor_read(weights, 0, weights_cpu, sizeof(weights_cpu)) == 0) {
+        return false;
+    }
+
+    const bool ok = metal_graph_routed_moe_one_from_routes(g, model, layer, il, out, x,
+                                                            selected_cpu, weights_cpu);
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after bitlift routed MoE\n");
+        return false;
+    }
+    return ok;
+}
+
+static bool metal_graph_routed_moe_batch_maybe_bitlift(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_layer_weights *layer,
+        uint32_t             il,
+        uint32_t             n_tokens) {
+    if (!bitlift_sidecar_enabled(layer)) {
+        const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+        const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+        const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+        const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+        return ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                                g->batch_routed_gate,
+                                                g->batch_routed_up,
+                                                g->batch_routed_mid,
+                                                g->batch_routed_down,
+                                                model->map,
+                                                model->size,
+                                                layer->ffn_gate_exps->abs_offset,
+                                                layer->ffn_up_exps->abs_offset,
+                                                layer->ffn_down_exps->abs_offset,
+                                                layer->ffn_gate_exps->type,
+                                                layer->ffn_down_exps->type,
+                                                gate_expert_bytes,
+                                                gate_row_bytes,
+                                                down_expert_bytes,
+                                                down_row_bytes,
+                                                DS4_N_EXPERT,
+                                                (uint32_t)expert_in_dim,
+                                                (uint32_t)down_in_dim,
+                                                (uint32_t)routed_out_dim,
+                                                g->batch_router_selected,
+                                                g->batch_router_weights,
+                                                DS4_N_EXPERT_USED,
+                                                DS4_SWIGLU_CLAMP_EXP,
+                                                g->batch_ffn_norm,
+                                                n_tokens,
+                                                &g->batch_routed_mid_is_f16) != 0;
+    }
+
+    if (!bitlift_sidecar_cpu_partition()) {
+        const uint64_t slot_off = (uint64_t)il * DS4_N_EXPERT * sizeof(int32_t);
+        if (ds4_gpu_bitlift_partition_routes_tensor(g->bitlift_batch_base_selected,
+                                                    g->bitlift_batch_base_weights,
+                                                    g->bitlift_batch_side_selected,
+                                                    g->bitlift_batch_side_weights,
+                                                    g->batch_router_selected,
+                                                    g->batch_router_weights,
+                                                    g->bitlift_slot_maps,
+                                                    slot_off,
+                                                    n_tokens,
+                                                    DS4_N_EXPERT_USED) == 0) {
+            return false;
+        }
+
+        const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
+        const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
+        const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
+        const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+
+        if (ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                            g->batch_routed_gate,
+                                            g->batch_routed_up,
+                                            g->batch_routed_mid,
+                                            g->batch_routed_down,
+                                            model->map,
+                                            model->size,
+                                            layer->ffn_gate_exps->abs_offset,
+                                            layer->ffn_up_exps->abs_offset,
+                                            layer->ffn_down_exps->abs_offset,
+                                            layer->ffn_gate_exps->type,
+                                            layer->ffn_down_exps->type,
+                                            gate_expert_bytes,
+                                            gate_row_bytes,
+                                            down_expert_bytes,
+                                            down_row_bytes,
+                                            DS4_N_EXPERT,
+                                            (uint32_t)expert_in_dim,
+                                            (uint32_t)down_in_dim,
+                                            (uint32_t)routed_out_dim,
+                                            g->bitlift_batch_base_selected,
+                                            g->bitlift_batch_base_weights,
+                                            DS4_N_EXPERT_USED,
+                                            DS4_SWIGLU_CLAMP_EXP,
+                                            g->batch_ffn_norm,
+                                            n_tokens,
+                                            &g->batch_routed_mid_is_f16) == 0) {
+            return false;
+        }
+
+        const ds4_model *side_model = layer->ffn_bitlift_model;
+        const ds4_tensor *gate = layer->ffn_gate_exps_bitlift_q4;
+        const ds4_tensor *up = layer->ffn_up_exps_bitlift_q4;
+        const ds4_tensor *down = layer->ffn_down_exps_bitlift_q4;
+        if (ds4_gpu_routed_moe_batch_tensor(g->bitlift_batch_tmp_out,
+                                            g->batch_routed_gate,
+                                            g->batch_routed_up,
+                                            g->batch_routed_mid,
+                                            g->batch_routed_down,
+                                            side_model->map,
+                                            side_model->size,
+                                            gate->abs_offset,
+                                            up->abs_offset,
+                                            down->abs_offset,
+                                            gate->type,
+                                            down->type,
+                                            gate->dim[1] * routed_expert_row_bytes(gate),
+                                            routed_expert_row_bytes(gate),
+                                            down->dim[1] * routed_expert_row_bytes(down),
+                                            routed_expert_row_bytes(down),
+                                            layer->ffn_bitlift_count,
+                                            (uint32_t)gate->dim[0],
+                                            (uint32_t)down->dim[0],
+                                            (uint32_t)down->dim[1],
+                                            g->bitlift_batch_side_selected,
+                                            g->bitlift_batch_side_weights,
+                                            DS4_N_EXPERT_USED,
+                                            DS4_SWIGLU_CLAMP_EXP,
+                                            g->batch_ffn_norm,
+                                            n_tokens,
+                                            &g->batch_routed_mid_is_f16) == 0) {
+            return false;
+        }
+
+        return ds4_gpu_add_tensor(g->batch_routed_out,
+                                  g->batch_routed_out,
+                                  g->bitlift_batch_tmp_out,
+                                  n_tokens * DS4_N_EMBD) != 0;
+    }
+
+    static bool warned = false;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: bitlift sidecar route tracing/CPU partition is enabled; "
+                "prefill and decode will synchronize for diagnostics\n");
+        warned = true;
+    }
+
+    const uint64_t route_count = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    int32_t *selected_cpu = xmalloc((size_t)route_count * sizeof(selected_cpu[0]));
+    float *weights_cpu = xmalloc((size_t)route_count * sizeof(weights_cpu[0]));
+    bool ok = ds4_gpu_synchronize() != 0 &&
+              ds4_gpu_tensor_read(g->batch_router_selected, 0,
+                                  selected_cpu, route_count * sizeof(selected_cpu[0])) != 0 &&
+              ds4_gpu_tensor_read(g->batch_router_weights, 0,
+                                  weights_cpu, route_count * sizeof(weights_cpu[0])) != 0;
+    g->batch_routed_mid_is_f16 = false;
+    for (uint32_t i = 0; ok && i < n_tokens; i++) {
+        ds4_gpu_tensor *x_view = ds4_gpu_tensor_view(
+                g->batch_ffn_norm,
+                (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *out_view = ds4_gpu_tensor_view(
+                g->batch_routed_out,
+                (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!x_view || !out_view) {
+            ok = false;
+        } else {
+            ok = metal_graph_routed_moe_one_from_routes(g,
+                                                        model,
+                                                        layer,
+                                                        il,
+                                                        out_view,
+                                                        x_view,
+                                                        selected_cpu + (uint64_t)i * DS4_N_EXPERT_USED,
+                                                        weights_cpu + (uint64_t)i * DS4_N_EXPERT_USED);
+        }
+        ds4_gpu_tensor_free(out_view);
+        ds4_gpu_tensor_free(x_view);
+    }
+    free(weights_cpu);
+    free(selected_cpu);
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr, "ds4: failed to resume Metal command batch after bitlift routed prefill\n");
+        return false;
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -9230,10 +9964,7 @@ static bool metal_graph_encode_decode_layer(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
@@ -9827,10 +10558,6 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
     if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
@@ -9851,24 +10578,15 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
-                                                 g->routed_gate,
-                                                 g->routed_up,
-                                                 g->routed_mid,
-                                                 g->routed_down,
-                                                 model->map, model->size,
-                                                 layer->ffn_gate_exps->abs_offset,
-                                                 layer->ffn_up_exps->abs_offset,
-                                                 layer->ffn_down_exps->abs_offset,
-                                                 layer->ffn_gate_exps->type,
-                                                 layer->ffn_down_exps->type,
-                                                 gate_expert_bytes, gate_row_bytes,
-                                                 down_expert_bytes, down_row_bytes,
-                                                 (uint32_t)expert_in_dim,
-                                                 (uint32_t)down_in_dim,
-                                                 (uint32_t)routed_out_dim,
-                                                 g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+    if (ok) ok = metal_graph_trace_router_decode_layer(g, il);
+    if (ok) ok = metal_graph_routed_moe_one_maybe_bitlift(g,
+                                                           model,
+                                                           layer,
+                                                           il,
+                                                           g->routed_out,
+                                                           g->ffn_norm,
+                                                           g->router_selected,
+                                                           g->router_weights);
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
@@ -12507,14 +13225,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
     const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
-    const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
-    const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
@@ -12628,32 +13339,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
-                                                   g->batch_routed_gate,
-                                                   g->batch_routed_up,
-                                                   g->batch_routed_mid,
-                                                   g->batch_routed_down,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->ffn_gate_exps->abs_offset,
-                                                   layer->ffn_up_exps->abs_offset,
-                                                   layer->ffn_down_exps->abs_offset,
-                                                   layer->ffn_gate_exps->type,
-                                                   layer->ffn_down_exps->type,
-                                                   gate_expert_bytes,
-                                                   gate_row_bytes,
-                                                   down_expert_bytes,
-                                                   down_row_bytes,
-                                                   (uint32_t)expert_in_dim,
-                                                   (uint32_t)down_in_dim,
-                                                   (uint32_t)routed_out_dim,
-                                                   g->batch_router_selected,
-                                                   g->batch_router_weights,
-                                                   DS4_N_EXPERT_USED,
-                                                   DS4_SWIGLU_CLAMP_EXP,
-                                                   g->batch_ffn_norm,
-                                                   n_tokens,
-                                                   &g->batch_routed_mid_is_f16) != 0;
+    if (ok) ok = metal_graph_routed_moe_batch_maybe_bitlift(g, model, layer, il, n_tokens);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
@@ -13004,7 +13690,7 @@ static bool metal_graph_eval_mtp_draft(
  * by expert: one tensor entry contains `n_expert * n_columns` floats and the
  * quantizer slices the vector for each expert.
  */
-typedef struct {
+typedef struct ds4_imatrix_collector {
     float *gate_up_sum2;   /* [layer][expert][4096] */
     float *down_sum2;      /* [layer][expert][2048] */
     uint32_t gate_up_count[DS4_N_LAYER][DS4_N_EXPERT];
@@ -13013,7 +13699,11 @@ typedef struct {
     float *routed_mid_buf;
     uint16_t *routed_mid_f16_buf;
     int   *selected_buf;
+    float *weight_buf;
+    int   *decode_selected_buf;
+    float *decode_weight_buf;
     float *sq_tmp;
+    double route_weight_sum[DS4_N_LAYER][DS4_N_EXPERT];
     uint32_t cap_tokens;
     uint64_t observed_tokens;
     uint64_t observed_routes;
@@ -13033,9 +13723,16 @@ static bool imatrix_collector_init(ds4_imatrix_collector *c, uint32_t cap_tokens
     c->routed_mid_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_buf[0]));
     c->routed_mid_f16_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(c->routed_mid_f16_buf[0]));
     c->selected_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]));
+    c->weight_buf = xmalloc((size_t)c->cap_tokens * DS4_N_EXPERT_USED * sizeof(c->weight_buf[0]));
+    c->decode_selected_buf = xmalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT_USED *
+                                     sizeof(c->decode_selected_buf[0]));
+    c->decode_weight_buf = xmalloc((size_t)DS4_N_LAYER * DS4_N_EXPERT_USED *
+                                   sizeof(c->decode_weight_buf[0]));
     c->sq_tmp = xmalloc((size_t)DS4_N_EMBD * sizeof(c->sq_tmp[0]));
     return c->gate_up_sum2 && c->down_sum2 && c->ffn_norm_buf &&
-           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf && c->sq_tmp;
+           c->routed_mid_buf && c->routed_mid_f16_buf && c->selected_buf &&
+           c->weight_buf && c->decode_selected_buf && c->decode_weight_buf &&
+           c->sq_tmp;
 }
 
 static void imatrix_collector_free(ds4_imatrix_collector *c) {
@@ -13046,6 +13743,9 @@ static void imatrix_collector_free(ds4_imatrix_collector *c) {
     free(c->routed_mid_buf);
     free(c->routed_mid_f16_buf);
     free(c->selected_buf);
+    free(c->weight_buf);
+    free(c->decode_selected_buf);
+    free(c->decode_weight_buf);
     free(c->sq_tmp);
     memset(c, 0, sizeof(*c));
 }
@@ -13070,12 +13770,14 @@ static bool imatrix_collect_layer_batch(
     const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
     const uint64_t mid_bytes = mid_elems * (g->batch_routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
+    const uint64_t weight_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(float);
     void *mid_dst = g->batch_routed_mid_is_f16
         ? (void *)c->routed_mid_f16_buf
         : (void *)c->routed_mid_buf;
     if (ds4_gpu_tensor_read(g->batch_ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
         ds4_gpu_tensor_read(g->batch_routed_mid, 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0)
+        ds4_gpu_tensor_read(g->batch_router_selected, 0, c->selected_buf, sel_bytes) == 0 ||
+        ds4_gpu_tensor_read(g->batch_router_weights, 0, c->weight_buf, weight_bytes) == 0)
     {
         return false;
     }
@@ -13087,10 +13789,12 @@ static bool imatrix_collect_layer_batch(
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             const int expert = c->selected_buf[(size_t)t * DS4_N_EXPERT_USED + slot];
             if (expert < 0 || expert >= DS4_N_EXPERT) continue;
+            const float weight = c->weight_buf[(size_t)t * DS4_N_EXPERT_USED + slot];
 
             float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
             for (uint32_t i = 0; i < DS4_N_EMBD; i++) gate_up[i] += c->sq_tmp[i];
             c->gate_up_count[il][expert]++;
+            c->route_weight_sum[il][expert] += (double)weight;
 
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
             const size_t mid_off = ((size_t)t * DS4_N_EXPERT_USED + slot) * DS4_N_FF_EXP;
@@ -13111,6 +13815,69 @@ static bool imatrix_collect_layer_batch(
     c->observed_tokens += n_tokens;
     c->chunks++;
     return true;
+}
+
+static bool imatrix_collect_decode_trace(
+        ds4_imatrix_collector *c,
+        ds4_gpu_graph         *g) {
+    if (!c || !g) return true;
+    const uint64_t slots = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT_USED;
+    if (ds4_gpu_tensor_read(g->trace_router_selected, 0,
+                            c->decode_selected_buf, slots * sizeof(c->decode_selected_buf[0])) == 0 ||
+        ds4_gpu_tensor_read(g->trace_router_weights, 0,
+                            c->decode_weight_buf, slots * sizeof(c->decode_weight_buf[0])) == 0)
+    {
+        return false;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+            const size_t off = (size_t)il * DS4_N_EXPERT_USED + slot;
+            const int expert = c->decode_selected_buf[off];
+            if (expert < 0 || expert >= DS4_N_EXPERT) continue;
+            c->gate_up_count[il][expert]++;
+            c->down_count[il][expert]++;
+            c->route_weight_sum[il][expert] += (double)c->decode_weight_buf[off];
+            c->observed_routes++;
+        }
+    }
+    c->observed_tokens++;
+    c->chunks++;
+    return true;
+}
+
+static bool metal_graph_eval_token_raw_swa_top_collect_routes(
+        ds4_gpu_graph         *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        int                   *top_id,
+        ds4_imatrix_collector *collector) {
+    if (!top_id) return false;
+    const bool prev_trace = g->trace_decode_routes;
+    g->trace_decode_routes = true;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, true, true);
+    if (ok) {
+        ok = ds4_gpu_indexer_topk_tensor(g->comp_selected,
+                                         g->logits,
+                                         DS4_N_VOCAB,
+                                         1,
+                                         1) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    g->trace_decode_routes = prev_trace;
+
+    if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
+    if (ok) ok = imatrix_collect_decode_trace(collector, g);
+    if (!ok) {
+        g->trace_decode_routes = prev_trace;
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after decode route top trace failure also failed\n");
+        }
+    }
+    return ok;
 }
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
@@ -13198,7 +13965,48 @@ static bool imatrix_collector_save(
     return true;
 }
 
+static bool imatrix_collector_save_expert_usage(
+        const ds4_imatrix_collector *c,
+        const char                  *path) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open expert usage output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+
+    fprintf(fp, "layer,expert,selected_count,weight_sum,count_share,weight_share\n");
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint64_t layer_count = 0;
+        double layer_weight = 0.0;
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            layer_count += c->gate_up_count[il][expert];
+            layer_weight += c->route_weight_sum[il][expert];
+        }
+
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            const uint32_t count = c->gate_up_count[il][expert];
+            const double weight = c->route_weight_sum[il][expert];
+            const double count_share = layer_count ? (double)count / (double)layer_count : 0.0;
+            const double weight_share = layer_weight > 0.0 ? weight / layer_weight : 0.0;
+            if (fprintf(fp, "%u,%u,%u,%.17g,%.17g,%.17g\n",
+                        il, expert, count, weight, count_share, weight_share) < 0)
+            {
+                fprintf(stderr, "ds4: failed to write expert usage output %s\n", path);
+                fclose(fp);
+                return false;
+            }
+        }
+    }
+
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close expert usage output %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+    memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -14371,6 +15179,7 @@ struct ds4_vocab {
 
 struct ds4_engine {
     ds4_model model;
+    ds4_model bitlift_model;
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
@@ -14384,6 +15193,7 @@ struct ds4_engine {
     float directional_steering_ffn_scale;
     bool quality;
     bool metal_ready;
+    bool bitlift_ready;
     bool mtp_ready;
 };
 
@@ -16792,20 +17602,29 @@ static char *imatrix_trim_block(char *p, char *end) {
 int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *dataset_path,
                                const char *output_path,
+                               const char *expert_usage_path,
                                int ctx_size,
                                int max_prompts,
-                               int max_tokens) {
+                               int max_tokens,
+                               int decode_tokens) {
 #ifdef DS4_NO_GPU
     (void)e;
     (void)dataset_path;
     (void)output_path;
+    (void)expert_usage_path;
     (void)ctx_size;
     (void)max_prompts;
     (void)max_tokens;
+    (void)decode_tokens;
     fprintf(stderr, "ds4: imatrix collection requires a graph backend build\n");
     return 1;
 #else
-    if (!e || !dataset_path || !output_path) return 1;
+    if (!e || !dataset_path || (!output_path && !expert_usage_path)) return 1;
+    if (decode_tokens < 0) return 1;
+    if (decode_tokens > 0 && output_path) {
+        fprintf(stderr, "ds4: decode expert usage tracing cannot write imatrix activation data\n");
+        return 1;
+    }
     if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) {
         fprintf(stderr, "ds4: imatrix collection currently requires --metal\n");
         return 1;
@@ -16817,6 +17636,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
     const ds4_model *model = &e->model;
+    const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
     const uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
@@ -16839,12 +17659,22 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
         return 1;
     }
 
-    fprintf(stderr,
-            "ds4: collecting routed-MoE imatrix from %s (ctx=%d, chunk=%u)\n",
-            dataset_path, ctx_size, prefill_cap);
+    if (decode_tokens > 0) {
+        fprintf(stderr,
+                "ds4: collecting routed-MoE decode expert usage from %s (ctx=%d, chunk=%u, decode=%d)\n",
+                dataset_path, ctx_size, prefill_cap, decode_tokens);
+    } else {
+        fprintf(stderr,
+                "ds4: collecting routed-MoE calibration stats from %s (ctx=%d, chunk=%u)\n",
+                dataset_path, ctx_size, prefill_cap);
+    }
 
     int prompts_done = 0;
     int tokens_done = 0;
+    int decode_tokens_done = 0;
+    float *decode_logits = decode_tokens > 0
+        ? xmalloc((size_t)DS4_N_VOCAB * sizeof(decode_logits[0]))
+        : NULL;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (*cursor) {
@@ -16877,17 +17707,38 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                     ok = metal_graph_prefill_chunked_range(&g, model, weights,
                                                            &prompt, 0,
                                                            (uint32_t)prompt.len,
-                                                           NULL, false,
+                                                           decode_logits, false,
                                                            NULL, NULL,
-                                                           &collector);
+                                                           decode_tokens > 0 ? NULL : &collector);
                 } else {
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
                                                          &prompt, prompt.len,
-                                                         NULL, false,
-                                                         &collector);
+                                                         decode_logits, false,
+                                                         decode_tokens > 0 ? NULL : &collector);
+                }
+                if (ok && decode_tokens > 0) {
+                    uint32_t pos = (uint32_t)prompt.len;
+                    int local_decode = 0;
+                    int token = sample_argmax(decode_logits, DS4_N_VOCAB);
+                    for (int i = 0; i < decode_tokens && pos < (uint32_t)ctx_size; i++) {
+                        if (token == vocab->eos_id) break;
+                        int next_token = -1;
+                        ok = metal_graph_eval_token_raw_swa_top_collect_routes(&g,
+                                                                                model,
+                                                                                weights,
+                                                                                token,
+                                                                                pos,
+                                                                                &next_token,
+                                                                                &collector);
+                        if (!ok) break;
+                        pos++;
+                        local_decode++;
+                        token = next_token;
+                    }
+                    decode_tokens_done += local_decode;
                 }
                 if (!ok) {
-                    fprintf(stderr, "ds4: imatrix prefill failed at prompt %d\n", prompts_done + 1);
+                    fprintf(stderr, "ds4: imatrix collection failed at prompt %d\n", prompts_done + 1);
                     token_vec_free(&prompt);
                     *end = saved;
                     break;
@@ -16895,11 +17746,20 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                 prompts_done++;
                 tokens_done += prompt.len;
                 if (prompts_done % 10 == 0) {
-                    fprintf(stderr,
-                            "ds4: imatrix prompts=%d tokens=%d routes=%llu\r",
-                            prompts_done,
-                            tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                    if (decode_tokens > 0) {
+                        fprintf(stderr,
+                                "ds4: expert usage prompts=%d prompt_tokens=%d decode_tokens=%d routes=%llu\r",
+                                prompts_done,
+                                tokens_done,
+                                decode_tokens_done,
+                                (unsigned long long)collector.observed_routes);
+                    } else {
+                        fprintf(stderr,
+                                "ds4: imatrix prompts=%d tokens=%d routes=%llu\r",
+                                prompts_done,
+                                tokens_done,
+                                (unsigned long long)collector.observed_routes);
+                    }
                     fflush(stderr);
                 }
             }
@@ -16913,7 +17773,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     }
     fputc('\n', stderr);
 
-    if (ok) {
+    if (ok && output_path) {
         ok = imatrix_collector_save(&collector, weights, output_path);
         if (ok) {
             fprintf(stderr,
@@ -16924,7 +17784,29 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                     (unsigned long long)collector.observed_routes);
         }
     }
+    if (ok && expert_usage_path) {
+        ok = imatrix_collector_save_expert_usage(&collector, expert_usage_path);
+        if (ok) {
+            if (decode_tokens > 0) {
+                fprintf(stderr,
+                        "ds4: wrote expert usage %s from %d prompts, %d prompt tokens, %d decode tokens, %llu routed expert observations\n",
+                        expert_usage_path,
+                        prompts_done,
+                        tokens_done,
+                        decode_tokens_done,
+                        (unsigned long long)collector.observed_routes);
+            } else {
+                fprintf(stderr,
+                        "ds4: wrote expert usage %s from %d prompts, %d tokens, %llu routed expert observations\n",
+                        expert_usage_path,
+                        prompts_done,
+                        tokens_done,
+                        (unsigned long long)collector.observed_routes);
+            }
+        }
+    }
 
+    free(decode_logits);
     imatrix_collector_free(&collector);
     metal_graph_free(&g);
     free(dataset);
@@ -17164,6 +18046,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
+    e->bitlift_model.fd = -1;
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
@@ -17192,6 +18075,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    if (opt->bitlift_sidecar_path && opt->bitlift_sidecar_path[0]) {
+        model_open(&e->bitlift_model, opt->bitlift_sidecar_path, graph_backend, false);
+        const uint32_t sidecar_layers = weights_bind_bitlift_sidecar(&e->weights, &e->bitlift_model);
+        if (sidecar_layers == 0) {
+            fprintf(stderr,
+                    "ds4: bitlift sidecar %s did not contain any usable sidecar layers\n",
+                    opt->bitlift_sidecar_path);
+            model_close(&e->bitlift_model);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->bitlift_ready = true;
+        fprintf(stderr, "ds4: bitlift sidecar loaded: %s (layers=%u)\n",
+                opt->bitlift_sidecar_path,
+                sidecar_layers);
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -17261,6 +18161,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (e->bitlift_ready &&
+            !ds4_gpu_set_model_map_range(e->bitlift_model.map,
+                                           e->bitlift_model.size,
+                                           e->bitlift_model.tensor_data_pos,
+                                           e->bitlift_model.size - e->bitlift_model.tensor_data_pos))
+        {
+            fprintf(stderr,
+                    "ds4: %s failed to map bitlift sidecar views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -17285,8 +18199,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return 0;
 }
 
+static void weights_bitlift_sidecar_summary(const ds4_weights *w) {
+    uint32_t layers = 0;
+    uint32_t expert_slots = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t n = w->layer[il].ffn_bitlift_count;
+        if (n == 0) continue;
+        layers++;
+        expert_slots += n;
+    }
+
+    if (expert_slots == 0) {
+        printf("bitlift sidecar: none\n");
+        return;
+    }
+
+    printf("bitlift sidecar: layers=%u expert_slots=%u tensor_triplets=%u qtype=q4_k\n",
+           layers,
+           expert_slots,
+           layers * 3u);
+}
+
 void ds4_engine_summary(ds4_engine *e) {
     model_summary(&e->model);
+    weights_bitlift_sidecar_summary(&e->weights);
 }
 
 void ds4_engine_close(ds4_engine *e) {
@@ -17295,6 +18231,7 @@ void ds4_engine_close(ds4_engine *e) {
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
+    if (e->bitlift_ready) model_close(&e->bitlift_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();

@@ -1603,11 +1603,31 @@ static void write_padding(FILE *fp, size_t n) {
     }
 }
 
+static void copy_tensor_from_template(FILE *dst_fp, FILE *tmpl_fp, const gguf_file *tmpl,
+                                      const tensor_meta *src, const char *out_path) {
+    if (fseeko(tmpl_fp, (off_t)(tmpl->data_offset + src->old_offset), SEEK_SET) != 0) {
+        die_errno("seek template GGUF", tmpl->path);
+    }
+    uint8_t buf[1024 * 1024];
+    size_t remaining = src->size;
+    while (remaining) {
+        size_t chunk = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        if (fread(buf, 1, chunk, tmpl_fp) != chunk) die_errno("read template tensor", tmpl->path);
+        if (fwrite(buf, 1, chunk, dst_fp) != chunk) die_errno("write tensor", out_path);
+        remaining -= chunk;
+    }
+}
+
 static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_context *out_ctx,
                             const char *out_path, int n_experts, int n_threads,
-                            const imatrix_store *imatrix) {
+                            const imatrix_store *imatrix, bool copy_unchanged) {
     FILE *fp = fopen(out_path, "wb");
     if (!fp) die_errno("open output", out_path);
+    FILE *tmpl_fp = NULL;
+    if (copy_unchanged) {
+        tmpl_fp = fopen(tmpl->path, "rb");
+        if (!tmpl_fp) die_errno("open template GGUF", tmpl->path);
+    }
     if (fwrite("GGUF", 1, 4, fp) != 4) die("write GGUF magic failed");
     write_u32(fp, tmpl->version);
     write_u64(fp, tmpl->n_tensors);
@@ -1631,6 +1651,13 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         const tensor_meta *src = &tmpl->tensors[i];
         const tensor_meta *dst = &out_ctx->tensors[i];
         fprintf(stderr, "[%4" PRIu64 "/%4" PRIu64 "] %s -> %s\n", i + 1, out_ctx->n_tensors, dst->name, ds4q_type_name(dst->type));
+        if (copy_unchanged && src->type == dst->type && src->size == dst->size) {
+            copy_tensor_from_template(fp, tmpl_fp, tmpl, src, out_path);
+            size_t padded = ds4q_pad(dst->size, out_ctx->alignment);
+            write_padding(fp, padded - dst->size);
+            fprintf(stderr, "       copied %.2f MiB\n", (double)dst->size / 1048576.0);
+            continue;
+        }
         byte_buf data = generate_tensor(db, dst->name, src, dst->type, n_experts, n_threads, imatrix);
         size_t expected = dst->size;
         if (data.size != expected) {
@@ -1643,6 +1670,7 @@ static void write_full_gguf(st_db *db, const gguf_file *tmpl, const output_conte
         fprintf(stderr, "       generated %.2f MiB\n", (double)data.size / 1048576.0);
         free(data.data);
     }
+    if (tmpl_fp) fclose(tmpl_fp);
     fclose(fp);
 }
 
@@ -1682,6 +1710,7 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    bool copy_unchanged;
 } params;
 
 static void usage(const char *argv0) {
@@ -1697,6 +1726,7 @@ static void usage(const char *argv0) {
     printf("  --dry-run              print output plan without reading HF tensor data\n");
     printf("  --imatrix FILE         legacy .dat imatrix from ds4 --imatrix-out\n");
     printf("  --imatrix-strict       fail if a quantized tensor has no matching imatrix vector\n");
+    printf("  --copy-unchanged       copy same-type tensors from template GGUF instead of regenerating\n");
     printf("  --experts TYPE         set routed w1/w2/w3 expert tensors to TYPE\n");
     printf("  --routed-w1 TYPE       routed gate expert tensor type\n");
     printf("  --routed-w2 TYPE       routed down expert tensor type\n");
@@ -1759,6 +1789,8 @@ static params parse_args(int argc, char **argv) {
             p.imatrix_file = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--imatrix-strict") == 0) {
             p.imatrix_strict = true;
+        } else if (strcmp(arg, "--copy-unchanged") == 0) {
+            p.copy_unchanged = true;
         } else if (strcmp(arg, "--experts") == 0 || strcmp(arg, "--routed") == 0) {
             ds4q_type t = parse_type(need_value(argc, argv, &i, arg));
             p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = t;
@@ -1875,7 +1907,7 @@ int main(int argc, char **argv) {
         free(out_ctx.tensors);
         return 0;
     }
-    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix);
+    write_full_gguf(&db, &tmpl, &out_ctx, p.out_gguf, p.n_experts, p.n_threads, &imatrix, p.copy_unchanged);
     fprintf(stderr, "wrote %s\n", p.out_gguf);
 
     db_close(&db);

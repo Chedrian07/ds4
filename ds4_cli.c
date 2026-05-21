@@ -37,8 +37,12 @@ typedef struct {
     int dump_logprobs_top_k;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
+    const char *expert_usage_output_path;
+    const char *batch_prompts_path;
+    const char *batch_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    int expert_usage_decode_tokens;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -84,6 +88,8 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
+        "  --bitlift-sidecar FILE\n"
+        "      Optional GGUF containing compact Q4 routed-expert sidecar tensors.\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --mtp-draft N\n"
@@ -118,6 +124,10 @@ static void usage(FILE *fp) {
         "      Prompt to generate from.\n"
         "  --prompt-file FILE\n"
         "      Read the prompt text from FILE.\n"
+        "  --batch-prompts-tsv FILE\n"
+        "      Run tab-separated rows: id, max_tokens, system, prompt. Escapes: \\n, \\t, \\r, \\\\.\n"
+        "  --batch-output-jsonl FILE\n"
+        "      Output JSONL for --batch-prompts-tsv without reloading the model per prompt.\n"
         "  -sys, --system TEXT\n"
         "      System prompt. Empty string disables the default. Default: You are a helpful assistant\n"
         "  -n, --tokens N\n"
@@ -164,6 +174,10 @@ static void usage(FILE *fp) {
         "      Rendered DS4 prompt dataset produced by misc/imatrix_dataset.\n"
         "  --imatrix-out FILE\n"
         "      Collect a routed-MoE activation imatrix and write llama-compatible .dat.\n"
+        "  --expert-usage-out FILE\n"
+        "      Collect routed-MoE expert selection counts and router weights as CSV.\n"
+        "  --expert-usage-decode-tokens N\n"
+        "      Trace N greedy decode tokens per prompt instead of prefill prompt tokens.\n"
         "  --imatrix-max-prompts N\n"
         "      Stop imatrix collection after N prompts. Default: no prompt limit\n"
         "  --imatrix-max-tokens N\n"
@@ -714,6 +728,293 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     return 0;
 }
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} cli_text_buffer;
+
+static bool cli_text_buffer_reserve(cli_text_buffer *b, size_t add) {
+    if (add > SIZE_MAX - b->len - 1) return false;
+    size_t need = b->len + add + 1;
+    if (need <= b->cap) return true;
+    size_t cap = b->cap ? b->cap : 4096;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) return false;
+        cap *= 2;
+    }
+    char *p = realloc(b->data, cap);
+    if (!p) return false;
+    b->data = p;
+    b->cap = cap;
+    return true;
+}
+
+static bool cli_text_buffer_append(cli_text_buffer *b, const char *s, size_t n) {
+    if (!cli_text_buffer_reserve(b, n)) return false;
+    if (n) memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+    return true;
+}
+
+static void cli_text_buffer_free(cli_text_buffer *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static char *batch_unescape_field(const char *s) {
+    size_t n = strlen(s);
+    char *out = malloc(n + 1);
+    if (!out) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\\' && i + 1 < n) {
+            char c = s[++i];
+            if (c == 'n') out[j++] = '\n';
+            else if (c == 't') out[j++] = '\t';
+            else if (c == 'r') out[j++] = '\r';
+            else if (c == '\\') out[j++] = '\\';
+            else {
+                out[j++] = '\\';
+                out[j++] = c;
+            }
+        } else {
+            out[j++] = s[i];
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+static bool batch_split_tsv_line(char *line, char *fields[4]) {
+    size_t n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+        line[--n] = '\0';
+    }
+    char *p = line;
+    for (int i = 0; i < 4; i++) {
+        fields[i] = p;
+        if (i == 3) return true;
+        char *tab = strchr(p, '\t');
+        if (!tab) return false;
+        *tab = '\0';
+        p = tab + 1;
+    }
+    return false;
+}
+
+static void batch_write_error_row(FILE *out, const char *id, int row, const char *err) {
+    fputs("{\"id\":", out);
+    json_write_string(out, id ? id : "", id ? strlen(id) : 0);
+    fprintf(out, ",\"row\":%d,\"returncode\":1,\"error\":", row);
+    json_write_string(out, err ? err : "unknown error", err ? strlen(err) : 13);
+    fputs("}\n", out);
+    fflush(out);
+}
+
+static int run_batch_generation(ds4_engine *engine, const cli_config *cfg) {
+    FILE *in = fopen(cfg->gen.batch_prompts_path, "rb");
+    if (!in) {
+        fprintf(stderr, "ds4: failed to open --batch-prompts-tsv file: %s\n",
+                cfg->gen.batch_prompts_path);
+        return 1;
+    }
+    FILE *out = fopen(cfg->gen.batch_output_path, "ab");
+    if (!out) {
+        fprintf(stderr, "ds4: failed to open --batch-output-jsonl file: %s\n",
+                cfg->gen.batch_output_path);
+        fclose(in);
+        return 1;
+    }
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: batch generation requires a session backend\n");
+        fclose(out);
+        fclose(in);
+        return 1;
+    }
+
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t line_len = 0;
+    int row = 0;
+    int rc_all = 0;
+    while ((line_len = getline(&line, &line_cap, in)) >= 0) {
+        (void)line_len;
+        row++;
+        if (line[0] == '\n' || line[0] == '\r' || line[0] == '#') continue;
+
+        char *fields[4] = {0};
+        if (!batch_split_tsv_line(line, fields)) {
+            batch_write_error_row(out, "", row, "invalid TSV row");
+            rc_all = 1;
+            continue;
+        }
+
+        char *id = batch_unescape_field(fields[0]);
+        char *system = batch_unescape_field(fields[2]);
+        char *prompt_text = batch_unescape_field(fields[3]);
+        if (!id || !system || !prompt_text) {
+            batch_write_error_row(out, id ? id : "", row, "allocation failed");
+            free(id);
+            free(system);
+            free(prompt_text);
+            rc_all = 1;
+            continue;
+        }
+
+        char *end = NULL;
+        long n_predict_long = strtol(fields[1], &end, 10);
+        if (fields[1][0] == '\0' || *end != '\0' ||
+            n_predict_long <= 0 || n_predict_long > INT32_MAX)
+        {
+            batch_write_error_row(out, id, row, "invalid max_tokens field");
+            free(id);
+            free(system);
+            free(prompt_text);
+            rc_all = 1;
+            continue;
+        }
+
+        cli_generation_options gen = cfg->gen;
+        gen.prompt = prompt_text;
+        gen.system = system;
+        gen.n_predict = (int)n_predict_long;
+
+        ds4_tokens prompt = {0};
+        build_prompt(engine, &gen, &prompt);
+        ds4_session_invalidate(session);
+
+        char err[160] = {0};
+        const double t_prefill0 = cli_now_sec();
+        int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+        const double t_prefill1 = cli_now_sec();
+
+        int generated = 0;
+        cli_text_buffer text = {0};
+        double t_decode0 = cli_now_sec();
+        double t_decode1 = t_decode0;
+        if (rc == 0) {
+            int max_tokens = gen.n_predict;
+            int room = ds4_session_ctx(session) - ds4_session_pos(session);
+            if (room <= 1) max_tokens = 0;
+            else if (max_tokens > room - 1) max_tokens = room - 1;
+
+            uint64_t rng = cfg->gen.seed ? cfg->gen.seed + (uint64_t)row :
+                ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock() ^ (uint64_t)row);
+            t_decode0 = cli_now_sec();
+            while (generated < max_tokens && !cli_interrupt_requested()) {
+                int token = ds4_session_sample(session, gen.temperature, 0,
+                                               gen.top_p, gen.min_p, &rng);
+                if (token == ds4_token_eos(engine)) break;
+
+                int toks[17];
+                int ntok = 0;
+                if (gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+                    ntok = ds4_session_eval_speculative_argmax(session,
+                                                               token,
+                                                               max_tokens - generated,
+                                                               ds4_token_eos(engine),
+                                                               toks,
+                                                               (int)(sizeof(toks) / sizeof(toks[0])),
+                                                               err,
+                                                               sizeof(err));
+                    if (ntok < 0) {
+                        rc = 1;
+                        break;
+                    }
+                } else {
+                    if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                        rc = 1;
+                        break;
+                    }
+                    toks[0] = token;
+                    ntok = 1;
+                }
+
+                bool stop = false;
+                for (int j = 0; j < ntok; j++) {
+                    if (toks[j] == ds4_token_eos(engine)) {
+                        stop = true;
+                        break;
+                    }
+                    size_t piece_len = 0;
+                    char *piece = ds4_token_text(engine, toks[j], &piece_len);
+                    if (!cli_text_buffer_append(&text, piece, piece_len)) {
+                        free(piece);
+                        snprintf(err, sizeof(err), "output allocation failed");
+                        rc = 1;
+                        stop = true;
+                        break;
+                    }
+                    free(piece);
+                    generated++;
+                    if (generated >= max_tokens) break;
+                }
+                if (stop || rc != 0) break;
+            }
+            t_decode1 = cli_now_sec();
+        }
+
+        const double prefill_s = t_prefill1 - t_prefill0;
+        const double decode_s = t_decode1 - t_decode0;
+        fprintf(out, "{\"id\":");
+        json_write_string(out, id, strlen(id));
+        fprintf(out,
+                ",\"row\":%d,\"returncode\":%d,\"prompt_tokens\":%d,"
+                "\"generated_tokens\":%d,\"prefill_seconds\":%.6f,"
+                "\"decode_seconds\":%.6f,\"prefill_tps\":%.6f,"
+                "\"generation_tps\":%.6f,\"output\":",
+                row,
+                rc,
+                prompt.len,
+                generated,
+                prefill_s,
+                decode_s,
+                prefill_s > 0.0 ? (double)prompt.len / prefill_s : 0.0,
+                decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+        json_write_string(out, text.data ? text.data : "", text.len);
+        if (rc != 0 && err[0]) {
+            fputs(",\"error\":", out);
+            json_write_string(out, err, strlen(err));
+        }
+        fputs("}\n", out);
+        fflush(out);
+        if (rc != 0) rc_all = 1;
+        if (cli_interrupt_requested()) {
+            cli_interrupt_clear();
+            rc_all = 130;
+            cli_text_buffer_free(&text);
+            ds4_tokens_free(&prompt);
+            free(id);
+            free(system);
+            free(prompt_text);
+            break;
+        }
+
+        fprintf(stderr, "ds4: batch row %d complete: prefill %.2f t/s, generation %.2f t/s\n",
+                row,
+                prefill_s > 0.0 ? (double)prompt.len / prefill_s : 0.0,
+                decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+        cli_text_buffer_free(&text);
+        ds4_tokens_free(&prompt);
+        free(id);
+        free(system);
+        free(prompt_text);
+    }
+
+    free(line);
+    ds4_session_free(session);
+    if (fclose(out) != 0) rc_all = 1;
+    if (fclose(in) != 0) rc_all = 1;
+    return rc_all;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1229,8 +1530,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.prompt = c.prompt_owned;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--batch-prompts-tsv")) {
+            if (c.gen.prompt) {
+                fprintf(stderr, "ds4: --batch-prompts-tsv cannot be combined with -p or --prompt-file\n");
+                exit(2);
+            }
+            c.gen.batch_prompts_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--batch-output-jsonl")) {
+            c.gen.batch_output_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--bitlift-sidecar")) {
+            c.engine.bitlift_sidecar_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -1280,6 +1591,13 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--imatrix-out")) {
             c.gen.imatrix_output_path = need_arg(&i, argc, argv, arg);
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--expert-usage-out")) {
+            c.gen.expert_usage_output_path = need_arg(&i, argc, argv, arg);
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--expert-usage-decode-tokens") ||
+                   !strcmp(arg, "--expert-usage-decode")) {
+            c.gen.expert_usage_decode_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--imatrix-max-prompts")) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
@@ -1323,12 +1641,41 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
-    if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
-        fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");
+    if ((c.gen.imatrix_output_path || c.gen.expert_usage_output_path) && !c.gen.imatrix_dataset_path) {
+        fprintf(stderr, "ds4: --imatrix-out and --expert-usage-out require --imatrix-dataset\n");
         exit(2);
     }
-    if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
-        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+    if (c.gen.batch_prompts_path && !c.gen.batch_output_path) {
+        fprintf(stderr, "ds4: --batch-prompts-tsv requires --batch-output-jsonl\n");
+        exit(2);
+    }
+    if (c.gen.batch_output_path && !c.gen.batch_prompts_path) {
+        fprintf(stderr, "ds4: --batch-output-jsonl requires --batch-prompts-tsv\n");
+        exit(2);
+    }
+    if (c.gen.batch_prompts_path &&
+        (c.gen.prompt || c.gen.imatrix_dataset_path || c.inspect))
+    {
+        fprintf(stderr, "ds4: --batch-prompts-tsv cannot be combined with prompt, imatrix, or --inspect modes\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_dataset_path &&
+        !c.gen.imatrix_output_path &&
+        !c.gen.expert_usage_output_path)
+    {
+        fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out or --expert-usage-out\n");
+        exit(2);
+    }
+    if (c.gen.expert_usage_decode_tokens < 0) {
+        fprintf(stderr, "ds4: --expert-usage-decode-tokens must be non-negative\n");
+        exit(2);
+    }
+    if (c.gen.expert_usage_decode_tokens > 0 && !c.gen.expert_usage_output_path) {
+        fprintf(stderr, "ds4: --expert-usage-decode-tokens requires --expert-usage-out\n");
+        exit(2);
+    }
+    if (c.gen.expert_usage_decode_tokens > 0 && c.gen.imatrix_output_path) {
+        fprintf(stderr, "ds4: decode expert usage tracing cannot be combined with --imatrix-out\n");
         exit(2);
     }
 
@@ -1361,13 +1708,17 @@ int main(int argc, char **argv) {
     int rc = 0;
     if (cfg.inspect) {
         ds4_engine_summary(engine);
-    } else if (cfg.gen.imatrix_output_path) {
+    } else if (cfg.gen.batch_prompts_path) {
+        rc = run_batch_generation(engine, &cfg);
+    } else if (cfg.gen.imatrix_output_path || cfg.gen.expert_usage_output_path) {
         rc = ds4_engine_collect_imatrix(engine,
                                         cfg.gen.imatrix_dataset_path,
                                         cfg.gen.imatrix_output_path,
+                                        cfg.gen.expert_usage_output_path,
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
-                                        cfg.gen.imatrix_max_tokens);
+                                        cfg.gen.imatrix_max_tokens,
+                                        cfg.gen.expert_usage_decode_tokens);
     } else if (cfg.gen.prompt == NULL) {
         rc = run_repl(engine, &cfg);
     } else {

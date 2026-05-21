@@ -581,6 +581,18 @@ int ds4_gpu_add_tensor(
         const ds4_gpu_tensor *b,
         uint32_t                n);
 
+int ds4_gpu_bitlift_partition_routes_tensor(
+        ds4_gpu_tensor       *base_selected,
+        ds4_gpu_tensor       *base_weights,
+        ds4_gpu_tensor       *side_selected,
+        ds4_gpu_tensor       *side_weights,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *slot_map,
+        uint64_t                slot_map_offset,
+        uint32_t                n_tokens,
+        uint32_t                n_expert);
+
 int ds4_gpu_directional_steering_project_tensor(
         ds4_gpu_tensor       *x,
         const ds4_gpu_tensor *directions,
@@ -639,6 +651,7 @@ int ds4_gpu_routed_moe_one_tensor(
         uint64_t                gate_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
+        uint32_t                tensor_n_expert,
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
@@ -665,6 +678,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint64_t                gate_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
+        uint32_t                tensor_n_expert,
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,

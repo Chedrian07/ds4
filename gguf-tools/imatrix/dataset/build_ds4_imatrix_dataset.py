@@ -2189,9 +2189,46 @@ def write_outputs(outdir: Path, records: list[Record]) -> None:
                                           encoding="utf-8")
 
 
+def make_prompt_jsonl_records(path: Path, records: list[Record], modes: tuple[str, ...]) -> None:
+    """Render external JSONL rows that contain a plain ``prompt`` field.
+
+    This is intentionally small and strict so calibration datasets can be kept
+    as task metadata JSONL while the imatrix/usage collector still receives the
+    fully rendered DS4 chat prompts it expects.
+    """
+
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+            prompt = row.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                raise SystemExit(f"{path}:{lineno}: expected non-empty string field 'prompt'")
+
+            rid = str(row.get("id") or f"prompt-jsonl-{lineno:06d}")
+            category = str(row.get("category") or "prompt_jsonl")
+            subcategory = str(row.get("subcategory") or "plain")
+            source = f"{subcategory}:{rid}"
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "user", "content": prompt},
+            ]
+            for mode in modes:
+                records.append(Record(rid, category, mode, source, messages, render(messages, mode)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=None, help="Output directory. Defaults to this script's directory.")
+    parser.add_argument("--prompt-jsonl", default=None,
+                        help="External JSONL containing plain calibration prompts in a 'prompt' field.")
+    parser.add_argument("--prompt-jsonl-mode", choices=("think", "nothink", "both"), default="nothink",
+                        help="Rendering mode for --prompt-jsonl. Default: nothink.")
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -2199,15 +2236,22 @@ def main() -> None:
     outdir = Path(args.out).resolve() if args.out else script_dir
 
     records: list[Record] = []
-    make_source_records(root, records)
-    make_agent_records(records)
-    make_general_records(records)
-    make_programming_records(records)
-    make_algorithm_records(records)
-    make_language_records(records)
-    make_translation_records(records)
-    make_eval_reasoning_records(root, records)
-    make_long_context_records(root, records)
+    if args.prompt_jsonl:
+        if args.prompt_jsonl_mode == "both":
+            modes = ("think", "nothink")
+        else:
+            modes = (args.prompt_jsonl_mode,)
+        make_prompt_jsonl_records(Path(args.prompt_jsonl).resolve(), records, modes)
+    else:
+        make_source_records(root, records)
+        make_agent_records(records)
+        make_general_records(records)
+        make_programming_records(records)
+        make_algorithm_records(records)
+        make_language_records(records)
+        make_translation_records(records)
+        make_eval_reasoning_records(root, records)
+        make_long_context_records(root, records)
     write_outputs(outdir, records)
 
     manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))

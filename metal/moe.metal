@@ -121,6 +121,48 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     float clamp_value;
 };
 
+struct ds4_metal_bitlift_partition_args {
+    uint32_t n_tokens;
+    uint32_t n_expert;
+    uint32_t n_slot_map;
+};
+
+// Split router top-k rows into base and sidecar lanes without CPU readback.
+// Entries that do not belong to a lane are mapped to expert/slot 0 with weight
+// 0. The downstream routed-MoE kernels can therefore keep the fixed top-6 shape
+// while producing a zero contribution for inactive lanes.
+kernel void kernel_dsv4_bitlift_partition_routes(
+        constant ds4_metal_bitlift_partition_args &args,
+        device const int32_t *selected,
+        device const float   *weights,
+        device const int32_t *slot_map,
+        device int32_t       *base_selected,
+        device float         *base_weights,
+        device int32_t       *side_selected,
+        device float         *side_weights,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_tokens * args.n_expert;
+    if (gid >= total) return;
+
+    const int32_t expert = selected[gid];
+    int32_t slot = -1;
+    if (expert >= 0 && (uint32_t)expert < args.n_slot_map) {
+        slot = slot_map[expert];
+    }
+
+    if (slot >= 0) {
+        base_selected[gid] = 0;
+        base_weights[gid] = 0.0f;
+        side_selected[gid] = slot;
+        side_weights[gid] = weights[gid];
+    } else {
+        base_selected[gid] = expert >= 0 ? expert : 0;
+        base_weights[gid] = weights[gid];
+        side_selected[gid] = 0;
+        side_weights[gid] = 0.0f;
+    }
+}
+
 // Routed-MoE activation for the selected experts:
 // clamp(gate), clamp(up), silu(gate) * up * route_weight.  Normal inference
 // does not consume gate/up after this point, so the fast path avoids writing the

@@ -59,6 +59,7 @@ static inline size_t ds4q_pad(size_t x, size_t n) {
 
 const char *ds4q_type_name(ds4q_type type);
 bool ds4q_can_quantize(ds4q_type type);
+bool ds4q_can_dequantize(ds4q_type type);
 int64_t ds4q_block_size(ds4q_type type);
 size_t ds4q_row_size(ds4q_type type, int64_t ne);
 bool ds4q_requires_imatrix(ds4q_type type);
@@ -66,6 +67,19 @@ void ds4q_quantize_init(ds4q_type type);
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix);
+size_t ds4q_dequantize_chunk(ds4q_type type, const void *src, float *dst,
+                             int64_t nrows, int64_t ncols);
+size_t ds4q_quantize_fp4_e8m0_to_q4_k_chunk(const void *packed_fp4,
+                                            const void *e8m0_scales,
+                                            void *dst,
+                                            int64_t nrows,
+                                            int64_t packed_cols);
+size_t ds4q_quantize_fp8_f32_to_q4_k_chunk(const void *fp8_e4m3,
+                                           const void *f32_scales,
+                                           void *dst,
+                                           int64_t nrows,
+                                           int64_t ncols,
+                                           int64_t scale_cols);
 
 float ds4q_f16_to_f32(uint16_t bits);
 float ds4q_bf16_to_f32(uint16_t bits);

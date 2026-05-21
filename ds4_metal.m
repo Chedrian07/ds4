@@ -188,7 +188,7 @@ static void ds4_gpu_print_device_summary(void) {
 }
 
 #define DS4_METAL_MAX_MODEL_VIEWS 16
-#define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+#define DS4_METAL_MODEL_MAX_TENSOR_BYTES (1152ull * 1024ull * 1024ull)
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -2660,6 +2660,12 @@ typedef struct {
     uint32_t write_clamped;
     float    clamp_value;
 } ds4_gpu_dsv4_moe_swiglu_weight_args;
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_expert;
+    uint32_t n_slot_map;
+} ds4_gpu_bitlift_partition_args;
 
 /* Compile the single in-repo Metal source and create the pipelines that every
  * session uses. Shape-dependent kernels with function constants are built
@@ -11356,6 +11362,88 @@ int ds4_gpu_add_tensor(
     return 1;
 }
 
+int ds4_gpu_bitlift_partition_routes_tensor(
+        ds4_gpu_tensor       *base_selected,
+        ds4_gpu_tensor       *base_weights,
+        ds4_gpu_tensor       *side_selected,
+        ds4_gpu_tensor       *side_weights,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *slot_map,
+        uint64_t                slot_map_offset,
+        uint32_t                n_tokens,
+        uint32_t                n_expert) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!base_selected || !base_weights || !side_selected || !side_weights ||
+        !selected || !weights || !slot_map ||
+        n_tokens == 0 || n_expert == 0 || n_expert > 6) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> base_sel_buf = ds4_gpu_tensor_buffer(base_selected);
+        id<MTLBuffer> base_w_buf = ds4_gpu_tensor_buffer(base_weights);
+        id<MTLBuffer> side_sel_buf = ds4_gpu_tensor_buffer(side_selected);
+        id<MTLBuffer> side_w_buf = ds4_gpu_tensor_buffer(side_weights);
+        id<MTLBuffer> selected_buf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weights_buf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> slot_map_buf = ds4_gpu_tensor_buffer(slot_map);
+        const uint64_t route_count = (uint64_t)n_tokens * n_expert;
+        const uint64_t selected_bytes = route_count * sizeof(int32_t);
+        const uint64_t weights_bytes = route_count * sizeof(float);
+        const uint64_t slot_map_bytes = (uint64_t)256u * sizeof(int32_t);
+        if (!base_sel_buf || !base_w_buf || !side_sel_buf || !side_w_buf ||
+            !selected_buf || !weights_buf || !slot_map_buf ||
+            ds4_gpu_tensor_bytes(base_selected) < selected_bytes ||
+            ds4_gpu_tensor_bytes(side_selected) < selected_bytes ||
+            ds4_gpu_tensor_bytes(selected) < selected_bytes ||
+            ds4_gpu_tensor_bytes(base_weights) < weights_bytes ||
+            ds4_gpu_tensor_bytes(side_weights) < weights_bytes ||
+            ds4_gpu_tensor_bytes(weights) < weights_bytes ||
+            slot_map_offset > ds4_gpu_tensor_bytes(slot_map) ||
+            slot_map_bytes > ds4_gpu_tensor_bytes(slot_map) - slot_map_offset) {
+            fprintf(stderr, "ds4: Metal bitlift route partition received undersized buffers\n");
+            return 0;
+        }
+        if (ds4_gpu_tensor_offset(slot_map) > NSUIntegerMax - slot_map_offset) return 0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_bitlift_partition_routes");
+        if (!pipeline) return 0;
+
+        ds4_gpu_bitlift_partition_args args = {
+            .n_tokens = n_tokens,
+            .n_expert = n_expert,
+            .n_slot_map = 256u,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:selected_buf offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+        [enc setBuffer:weights_buf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+        [enc setBuffer:slot_map_buf offset:(NSUInteger)(ds4_gpu_tensor_offset(slot_map) + slot_map_offset) atIndex:3];
+        [enc setBuffer:base_sel_buf offset:ds4_gpu_tensor_offset(base_selected) atIndex:4];
+        [enc setBuffer:base_w_buf offset:ds4_gpu_tensor_offset(base_weights) atIndex:5];
+        [enc setBuffer:side_sel_buf offset:ds4_gpu_tensor_offset(side_selected) atIndex:6];
+        [enc setBuffer:side_w_buf offset:ds4_gpu_tensor_offset(side_weights) atIndex:7];
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 128u) nth = 128u;
+        if (nth == 0) nth = 1u;
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)route_count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "bitlift route partition")) return 0;
+    }
+
+    return 1;
+}
+
 typedef struct {
     uint32_t width;
     uint32_t rows;
@@ -12824,6 +12912,7 @@ int ds4_gpu_routed_moe_one_tensor(
         uint64_t                gate_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
+        uint32_t                tensor_n_expert,
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
@@ -12837,7 +12926,8 @@ int ds4_gpu_routed_moe_one_tensor(
         n_expert == 0 || n_expert > 6) {
         return 0;
     }
-    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
+    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0 ||
+        tensor_n_expert == 0) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -12869,8 +12959,8 @@ int ds4_gpu_routed_moe_one_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint64_t gate_tensor_bytes = (uint64_t)tensor_n_expert * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)tensor_n_expert * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -12901,11 +12991,11 @@ int ds4_gpu_routed_moe_one_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, tensor_n_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, tensor_n_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -13130,6 +13220,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint64_t                gate_row_bytes,
         uint64_t                down_expert_bytes,
         uint64_t                down_row_bytes,
+        uint32_t                tensor_n_expert,
         uint32_t                expert_in_dim,
         uint32_t                expert_mid_dim,
         uint32_t                out_dim,
@@ -13145,7 +13236,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         n_tokens == 0 || n_expert == 0 || n_expert > 6) {
         return 0;
     }
-    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
+    if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0 ||
+        tensor_n_expert == 0) return 0;
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
@@ -13179,8 +13271,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             return 0;
         }
 
-        const uint64_t gate_tensor_bytes = 256ull * gate_expert_bytes;
-        const uint64_t down_tensor_bytes = 256ull * down_expert_bytes;
+        const uint64_t gate_tensor_bytes = (uint64_t)tensor_n_expert * gate_expert_bytes;
+        const uint64_t down_tensor_bytes = (uint64_t)tensor_n_expert * down_expert_bytes;
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
@@ -13212,11 +13304,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
 
         ds4_gpu_mul_mv_id_args gate_args =
-            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, tensor_n_expert,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_gpu_mul_mv_id_args down_args =
-            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, tensor_n_expert,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         const bool use_mm_id = n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
@@ -13251,13 +13343,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             !g_quality_mode && getenv("DS4_METAL_MOE_MID_F32") == NULL;
         if (use_mm_id) {
             gate_map_args =
-                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
+                ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, tensor_n_expert, 1, n_expert, n_tokens);
             gate_mm_args =
-                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, 256,
+                ds4_gpu_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, tensor_n_expert,
                                               gate_row_bytes, gate_expert_bytes,
                                               1, n_expert, n_tokens);
             down_mm_args =
-                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, 256,
+                ds4_gpu_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, tensor_n_expert,
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));

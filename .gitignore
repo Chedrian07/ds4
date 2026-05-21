@@ -8,6 +8,8 @@
 /ds4flash.gguf
 /TODO.md
 /gguf/
+/hf-partial/
+/runs/
 *.o
 *.dSYM/
 /misc/
